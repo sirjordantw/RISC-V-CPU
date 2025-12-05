@@ -1,0 +1,139 @@
+module cpu(
+	input logic clk, 
+	input logic rst_n,
+	input logic [31:0] io0_in,
+	output logic [31:0] io2_out
+);
+	logic [31:0] inst_ram [4095:0];
+	initial $readmemh("instmem.dat",inst_ram);
+	
+	logic [11:0] PC_FETCH;
+	logic [31:0] instruction_EX;
+	logic [12:0] B_offset_EX;
+	logic [11:0] B_addr_EX;
+	logic [20:0] J_offset_EX;
+	logic [19:0] J_addr_EX;
+	logic [11:0] JR_offset_EX;
+	logic [31:0] JR_addr_EX;
+	logic [31:0] PC_EX;
+	logic [1:0] pcsrc_EX;
+	
+	always_ff @(posedge clk) begin
+		if (~rst_n) begin
+			PC_FETCH <= 12'd0;
+			instruction_EX <= 32'd0;
+		end else begin
+			if (pcsrc_EX==2'b00) PC_FETCH <= PC_FETCH + 1'b1;
+			else if (pcsrc_EX==2'b01) PC_FETCH <= B_addr_EX;
+			else if (pcsrc_EX==2'b10) PC_FETCH <= J_addr_EX;
+			else if (pcsrc_EX==2'b11) PC_FETCH <= JR_addr_EX;
+			instruction_EX <= inst_ram[PC_FETCH];
+		end
+	end
+	
+	always_ff @(posedge clk) begin
+		PC_EX<=PC_FETCH;
+	end
+	
+	assign B_offset_EX = {instruction_EX[31], instruction_EX[7], instruction_EX[30:25], instruction_EX[11:8], 1'b0};
+	assign J_offset_EX = {instruction_EX[31],instruction_EX[19:12],instruction_EX[20],instruction_EX[30:21],1'b0};
+	assign JR_offset_EX = instruction_EX[31:20];
+	
+	
+	assign B_addr_EX = PC_EX + {B_offset_EX[12], B_offset_EX[12:2]};
+	assign J_addr_EX = PC_EX + J_offset_EX[13:2];
+	
+	//Decoder
+	logic [6:0] op_ex;
+	logic [4:0] rd_ex;
+	logic [2:0] funct3_ex;
+	logic [4:0] rs1_ex;
+	logic [4:0] rs2_ex;
+	logic [6:0] funct7_ex;
+	logic [11:0] imm12_ex;
+	logic [19:0] imm20_ex;
+	
+	decoder dec_ex(.A(instruction_EX), .op(op_ex), .rd(rd_ex), .funct3(funct3_ex), .rs1(rs1_ex), .rs2(rs2_ex), .funct7(funct7_ex), .imm12(imm12_ex), .imm20(imm20_ex));
+	
+	logic [4:0] rd_wb;
+	always_ff @(posedge clk) begin
+		rd_wb<=rd_ex;
+	end
+	
+	//Control Unit
+	logic stall_ex;
+	logic stall_fetch;
+	logic [3:0] aluop_ex;
+	logic [1:0] regsel_ex;
+	logic regwrite_ex;
+	logic GPIO_we_ex;
+	logic alusrc_ex;
+	logic [31:0] r_ex;
+	
+	control cont_ex(.stall(stall_ex), .R(r_ex), .op(op_ex), .funct3(funct3_ex), .funct7(funct7_ex), .imm12(imm12_ex), .aluop(aluop_ex), .regsel(regsel_ex), .regwrite(regwrite_ex), .GPIO_we(GPIO_we_ex), .alusrc(alusrc_ex), .pcsrc(pcsrc_EX), .stall_fetch(stall_fetch));
+	
+	always_ff @(posedge clk) begin
+		stall_ex<=stall_fetch;
+	end
+	
+	//WB
+	logic [1:0] regsel_wb;
+	logic [19:0] imm20_wb;
+	always_ff @(posedge clk) begin
+		regsel_wb<=regsel_ex;
+		imm20_wb<=imm20_ex;
+	end
+	
+	//Sign Extend
+	logic [31:0] extend;
+	always_comb begin
+		extend={{20{imm12_ex[11]}}, imm12_ex};
+	end
+	
+	//ALU
+	logic [31:0] read1_ex;
+	logic [31:0] read2_ex;
+	logic [31:0] B_ex;
+	always_comb begin
+		if (alusrc_ex==1'b0) B_ex=read2_ex;
+		else B_ex=extend;
+	end
+	logic zero;
+	alu alu_ex(.A(read1_ex), .B(B_ex), .op(aluop_ex), .R(r_ex), .zero(zero));
+	
+	assign JR_addr_EX = read1_ex[11:0] + {{2{JR_offset_EX[11]}},JR_offset_EX[11:2]}; 
+	
+	logic [31:0] r_wb;
+	always_ff @(posedge clk) begin
+		r_wb<=r_ex;
+	end
+
+	//RegFile
+	logic [4:0] writeaddr_ex;
+	always_ff @(posedge clk) begin
+		writeaddr_ex<=rd_ex;
+	end
+	logic we_ex;
+	always_ff @(posedge clk) begin
+		we_ex<=regwrite_ex;
+	end
+	logic [31:0] writedata_ex;
+	always_comb begin
+		if (regsel_wb==2'b00) writedata_ex=io0_in;
+		else if (regsel_wb==2'b01) writedata_ex={imm20_wb, 12'b0};
+		else if (regsel_wb==2'b10) writedata_ex=r_wb;
+		else writedata_ex={20'b0, PC_EX};
+	end
+	regfile file_ex(.clk(clk), .we(we_ex), .readaddr1(rs1_ex), .readaddr2(rs2_ex), .writeaddr(rd_wb), .writedata(writedata_ex), .readdata1(read1_ex), .readdata2(read2_ex));
+	
+	//io2
+	always_ff @(posedge clk, negedge rst_n) begin
+		if (!rst_n) begin
+			io2_out<=32'b0;
+		end else begin
+			if (GPIO_we_ex) begin	
+				io2_out<=read1_ex;
+			end
+		end
+	end
+endmodule
